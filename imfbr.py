@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 import re
 import exponential_model as em
+import polynomial_model as pm
 from pathlib import Path
 
 class imfbr:
@@ -197,7 +198,7 @@ class imfbr:
             self.model = em.exponential_model(self.img, self.grown_absolute_dark_mask, self.settings)
         elif (m := re.fullmatch(r"p(\d)", self.model_type)):
             print(f"Using {m.group(1)}-order polynomial model.")
-        #    model = polym.polynomial_model(int(m.group(1)))
+            self.model = pm.polynomial_model(self.img, int(m.group(1)))
         else:
             print("Unknown model: " + self.model_type)
             exit()
@@ -213,26 +214,26 @@ class imfbr:
             print("Fitting background model...")
 
             print("Calculating region of interest...")
-            region_of_interest = self.create_model_dark_mask(None if (region_of_interest is None) else self.model.generate_background())
+            new_region_of_interest = self.create_model_dark_mask(None if (region_of_interest is None) else self.model.generate_background())
             if self.show_debug_pictures:
-                mask_displayed_image.set_data(region_of_interest)
+                mask_displayed_image.set_data(new_region_of_interest)
                 axes.set_title("Current mask")
                 figure.canvas.draw_idle()     # schedule redraw
                 figure.canvas.flush_events()  # process events immediately
 
-            print(f"Median in region of interest: {np.median(self.img[region_of_interest])}")
+            print(f"Median in region of interest: {np.median(self.img[new_region_of_interest])}")
 
-            new_pixels = region_of_interest & ~union_region_of_interest
+            new_pixels = new_region_of_interest & ~union_region_of_interest
             if not new_pixels.any():
                 print("Stopping as background mask doesn't have new pixels.")
                 improved = False
                 break
             else:
-                pct_total = new_pixels.sum() / region_of_interest.sum() * 100
+                pct_total = new_pixels.sum() / new_region_of_interest.sum() * 100
                 print(f"Mask change: {pct_total:.2f}% of image")
 
-            new_cost, new_params = self.model.fit_params(self.img, region_of_interest)
-            print(f"New cost: {new_cost} Last cost: {last_cost}")
+            new_cost, new_params = self.model.fit_params(self.img, new_region_of_interest)
+            print(f"New cost: {new_cost:.6g} Last cost: {last_cost:.6g}")
 
             const_improvement = last_cost - new_cost
             improved = const_improvement > 0.0
@@ -241,9 +242,10 @@ class imfbr:
                 self.model.set_params(new_params)
                 print("New parameters:")
                 self.model.print_params()
+                region_of_interest = new_region_of_interest
                 union_region_of_interest |= region_of_interest
 
-            if const_improvement < self.min_cost_change:
+            if const_improvement/last_cost < self.min_cost_change:
                 print("Stopping as cost improvement is less than the threshold.")
                 improved = False
 
@@ -251,7 +253,8 @@ class imfbr:
         self.model.print_params()
         if self.print_pixelmath_expression:
             print("Pixelmath expression:")
-            self.model.print_pixelmath_expression(self.img, region_of_interest)
+            pixelmath_expression = self.model.pixelmath_expression()
+            print(f"$T - ({pixelmath_expression}) + {np.median(self.img[region_of_interest])}")
 
         if self.show_debug_pictures:
             print("Close the debug window to finish the script.")

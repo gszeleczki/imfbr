@@ -22,26 +22,22 @@ class exponential_model:
         return grad_dir[mask]
 
     def create_coordinates(self, img):
-        ny, nx = img.shape
-        y, x = np.mgrid[0:ny, 0:nx]
+        height, width = img.shape
+        y, x = np.mgrid[0:height, 0:width]
 
-        self.x = x / (nx - 1)
-        self.y = y / (ny - 1)
+        self.x = x / (width - 1)
+        self.y = y / (height - 1)
 
-    def calc_diagonal(self, img):
-        diagonal_x, diagonal_y = img.shape
-        return (diagonal_x ** 2.0 + diagonal_y ** 2.0) ** 0.5
+        self.shape = img.shape
+        self.diagonal = (height ** 2.0 + width ** 2.0) ** 0.5
 
     def description(self):
         return "Exponential model in a form of [amplitude * exp((cos(direction) * x + sin(direction) * y) * decay) + constant]."
 
     # Calculates the distance of points from a line which goes through the origin.
     # Returns a 2D array.
-    def project_coordinates(self, shape, angle):
-        height, width = shape
-        y, x = np.indices((height, width))
-        projected_coordinates = np.cos(angle) * x + np.sin(angle) * y
-        return projected_coordinates
+    def project_coordinates(self, direction):
+        return np.cos(direction) * self.x + np.sin(direction) * self.y
 
     def estimate_decay_and_offset(self, projected_vals, gradient, img_flattened):
         valid_values_mask = np.isfinite(projected_vals) & np.isfinite(gradient) & np.isfinite(img_flattened)
@@ -64,19 +60,19 @@ class exponential_model:
     def estimate_initial_values(self, img, mask):
         direction = self.estimate_direction(img, mask)
 
-        projected_vals = self.project_coordinates(img.shape, direction)[mask]
+        projected_vals = self.project_coordinates(direction)[mask]
         img_vals = img[mask]
 
         gradient = self.directional_gradient(img, direction, mask)
         decay, offset = self.estimate_decay_and_offset(projected_vals, gradient, img_vals)
 
-        return self.estimate_amplitude(img, mask, direction, decay, offset, self.initial_amplitude_clip_percentiles), decay * self.calc_diagonal(img), direction, offset
+        return self.estimate_amplitude(img, mask, direction, decay, offset, self.initial_amplitude_clip_percentiles), decay, direction, offset
 
     def generate_background(self, params = None):
         local_params = self.params if (params is None) else params
         coefficient, decay, direction, offset = local_params
-        proj = np.cos(direction) * self.x + np.sin(direction) * self.y
-        return coefficient * np.exp(decay * proj) + offset
+        projected_coordinates = self.project_coordinates(direction)
+        return coefficient * np.exp(decay * projected_coordinates) + offset
 
     def estimate_direction(self, img, mask):
         y, x = np.nonzero(mask)
@@ -96,11 +92,8 @@ class exponential_model:
         background = self.generate_background(params)
         return (img - background)[mask].ravel()
 
-    def estimate_amplitude(self, img, mask, angle, decay, offset, clip_percentiles):
-        height, width = img.shape
-        y, x = np.mgrid[:height, :width]
-
-        projected_coordinates = np.cos(angle) * x + np.sin(angle) * y
+    def estimate_amplitude(self, img, mask, direction, decay, offset, clip_percentiles):
+        projected_coordinates = self.project_coordinates(direction)
         exponentials = np.exp(decay * projected_coordinates)
 
         masked_img = img[mask]
@@ -121,18 +114,18 @@ class exponential_model:
         self.params = params
 
     def print_params(self):
-        amplitude, decay, angle, offset = self.params
-        print(f"amplitude  = {amplitude}")
-        print(f"decay      = {decay}")
-        print(f"angle      = {angle} rad {angle * 180.0 / np.pi} deg")
-        print(f"offset     = {offset}")
+        amplitude, decay, direction, offset = self.params
+        print(f"amplitude  = {amplitude:.6g}")
+        print(f"decay      = {decay:.6g}")
+        print(f"direction  = {direction:.6f} rad ({np.degrees(direction):.2f} deg)")
+        print(f"offset     = {offset:.6g}")
 
-    def print_pixelmath_expression(self, img, region_of_interest):
+    def pixelmath_expression(self):
         amplitude, decay, direction, constant = self.params
         cos_angle = np.cos(direction)
         sin_angle = np.sin(direction)
-        print(f"$T - {amplitude} * exp({decay / self.calc_diagonal(img)} * ({cos_angle} * x() + {sin_angle} * y())) - {constant} + {np.median(img[region_of_interest])}")
-        # $T - 0.003408024138224537 * exp(-0.4752065977993465 * x() + -0.05742004767700772 * y()) - 0.001582727585407239 + 0.004
+        height, width = self.shape
+        return f"{amplitude} * exp({decay} * (({cos_angle} * x() / {width - 1}) + ({sin_angle} * y() / {height - 1}))) + {constant}"
 
     def fit_params(self, img, region_of_interest):
         result = least_squares(self.residuals, self.params, args = (img, region_of_interest), method = self.method, loss = self.loss_function, verbose = 2, ftol = self.ftol, f_scale = np.std(img[region_of_interest]))
