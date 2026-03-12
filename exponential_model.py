@@ -4,7 +4,7 @@ from scipy.optimize import least_squares
 # TODO: Add separate linear parameter
 
 class exponential_model:
-    def __init__(self, img, mask, settings):
+    def __init__(self, img, absolute_dark_mask, settings):
         self.initial_amplitude_clip_percentiles = settings["e_inital_amplitude_clip_percentile_min"], settings["e_inital_amplitude_clip_percentile_max"]
         self.inital_significant_gradient_min_percentile = settings["e_inital_significant_gradient_min_percentile"]
         self.loss_function = settings["e_loss_function"]
@@ -12,7 +12,7 @@ class exponential_model:
         self.ftol = settings["e_ftol"]
         self.create_coordinates(img)
         print("Estimating initial values...")
-        self.params = self.estimate_initial_values(img, mask)
+        self.params = self.estimate_initial_values(img, absolute_dark_mask)
         self.print_params()
 
     # Calculates the length of the projected gradient vector for each pixel.
@@ -127,6 +127,6 @@ class exponential_model:
         height, width = self.shape
         return f"{amplitude} * exp({decay} * (({cos_angle} * x() / {width - 1}) + ({sin_angle} * y() / {height - 1}))) + {constant}"
 
-    def fit_params(self, img, region_of_interest):
+    def fit_params(self, img, region_of_interest, absolute_dark_mask):
         result = least_squares(self.residuals, self.params, args = (img, region_of_interest), method = self.method, loss = self.loss_function, verbose = 2, ftol = self.ftol, f_scale = np.std(img[region_of_interest]))
         return result.cost, result.x

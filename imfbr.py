@@ -2,7 +2,6 @@
 
 from astropy.io import fits
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.ndimage import binary_erosion
 from scipy.ndimage import binary_dilation
 from scipy.ndimage import gaussian_filter
@@ -13,6 +12,7 @@ from pathlib import Path
 import re
 import exponential_model as em
 import polynomial_model as pm
+import debug_window as dw
 from pathlib import Path
 
 class imfbr:
@@ -33,7 +33,9 @@ class imfbr:
         "e_inital_significant_gradient_min_percentile" : 5.0,
         "e_loss_function" : "linear",
         "e_method" : "trf",
-        "e_ftol" : None
+        "e_ftol" : None,
+
+        "p_adaptive_order" : True
     }
 
     EXPLICIT_TYPES = {
@@ -53,7 +55,8 @@ class imfbr:
         parser = argparse.ArgumentParser(description="IMFBR - Iterative Model Fitting Background Remover")
 
         parser.add_argument("-i", "--input_paths", type=str, help="Input file paths, separated by |. If omitted, all *.fit images in the current directory will be used.")
-        parser.add_argument("-m", "--model_type", type=str, help="Background model:\n  e: Exponential model in a form of [amplitude * exp((cos(direction) * x + sin(direction) * y) * decay) + constant]\n  p[n]: Polynomial with order n")
+        parser.add_argument("-m", "--model_type", type=str, help="""Background model:\n  e: Exponential model in a form of
+        [amplitude * exp((cos(direction) * x + sin(direction) * y) * decay) + constant]\n  p[n]: Polynomial with order n""")
         parser.add_argument("-bp", "--background_percentile", type=float, help="The percentile of the area which can be considered as background.")
         parser.add_argument("--dark_absolute_threshold", type=float, help="Any pixel value below this will be masked out.")
         parser.add_argument("--discarded_edge_size", type=int, help="The initial mask will be dilated by this many pixels (can be used to mask rough edges)")
@@ -69,6 +72,9 @@ class imfbr:
         parser.add_argument("--e_loss_function", type=str, help="[exponential model] The loss function - see scipy documentation of least squares for possible values.")
         parser.add_argument("--e_method", type=str, help="[exponential model] The fitting method - see scipy documentation of least squares for possible values.")
         parser.add_argument("--e_ftol", type=float, help="[exponential model] Tolerance for termination by the change of the cost function - see scipy documentation for more info.")
+
+        parser.add_argument("--p_adaptive_order", type=bool, help="""[polynomial model] The model starts with a linear model, and only uses higher order terms, if the MAD on the whole image is lower.
+        Although it makes the algorithm slower, it's heavily recommended as it makes the convergence more robust and disables overfitting higher order terms.""")
 
         args = parser.parse_args()
 
@@ -145,7 +151,7 @@ class imfbr:
         plt.show()
 
     def run(self):
-        plt.ion()
+        self.show_debug_pictures = None
         self.load_settings()
         if not self.input_paths:
             script_dir = Path(__file__).resolve().parent
@@ -170,12 +176,8 @@ class imfbr:
         print("Creating absolute dark mask...")
         self.absolute_dark_mask = self.create_absolute_dark_mask(self.img, self.dark_absolute_threshold)
         if self.show_debug_pictures:
-            figure, axes = plt.subplots()
-            mask_displayed_image = axes.imshow(self.absolute_dark_mask, cmap='gray', vmin=0, vmax=1)
-            axes.set_title("Initial absolute mask")
-            figure.canvas.manager.set_window_title("IMFBR debug window")
-            figure.canvas.draw()          # render now
-            figure.canvas.flush_events()  # process GUI events
+            self.debug_window = dw.imfbr_debug_window(self.img, self.absolute_dark_mask)
+            self.debug_window.update_absolute_mask_image(self.absolute_dark_mask)
 
         total_pixels = self.absolute_dark_mask.size
         total_pixels_mp = int(total_pixels / 1000000)
@@ -198,7 +200,7 @@ class imfbr:
             self.model = em.exponential_model(self.img, self.grown_absolute_dark_mask, self.settings)
         elif (m := re.fullmatch(r"p(\d)", self.model_type)):
             print(f"Using {m.group(1)}-order polynomial model.")
-            self.model = pm.polynomial_model(self.img, int(m.group(1)))
+            self.model = pm.polynomial_model(self.img, int(m.group(1)), self.settings)
         else:
             print("Unknown model: " + self.model_type)
             exit()
@@ -206,38 +208,41 @@ class imfbr:
         union_region_of_interest = np.zeros_like(self.img, dtype=bool)
         region_of_interest = None
         last_cost = float("inf")
-        improved = True
+        running = True
 
-        while improved:
+        while running:
             print("")
             print("***************************")
-            print("Fitting background model...")
-
             print("Calculating region of interest...")
-            new_region_of_interest = self.create_model_dark_mask(None if (region_of_interest is None) else self.model.generate_background())
-            if self.show_debug_pictures:
-                mask_displayed_image.set_data(new_region_of_interest)
-                axes.set_title("Current mask")
-                figure.canvas.draw_idle()     # schedule redraw
-                figure.canvas.flush_events()  # process events immediately
+            background = None if (region_of_interest is None) else self.model.generate_background()
+            if not (self.debug_window is None) and not (background is None):
+                self.debug_window.update_background_image(background)
+                self.debug_window.update_corrected_image(self.img - background)
 
-            print(f"Median in region of interest: {np.median(self.img[new_region_of_interest])}")
+            new_region_of_interest = self.create_model_dark_mask(background)
+            if not (self.debug_window is None):
+                self.debug_window.update_region_of_interest(new_region_of_interest)
+            print(f"Median in region of interest: {np.median(self.img[new_region_of_interest]):.6g}")
 
             new_pixels = new_region_of_interest & ~union_region_of_interest
             if not new_pixels.any():
                 print("Stopping as background mask doesn't have new pixels.")
-                improved = False
+                running = False
                 break
             else:
                 pct_total = new_pixels.sum() / new_region_of_interest.sum() * 100
                 print(f"Mask change: {pct_total:.2f}% of image")
 
-            new_cost, new_params = self.model.fit_params(self.img, new_region_of_interest)
+            print(f"Fitting parameters...")
+            new_cost, new_params = self.model.fit_params(self.img, new_region_of_interest, self.grown_absolute_dark_mask)
             print(f"New cost: {new_cost:.6g} Last cost: {last_cost:.6g}")
 
-            const_improvement = last_cost - new_cost
-            improved = const_improvement > 0.0
-            if improved:
+            cost_improvement = last_cost - new_cost
+
+            if cost_improvement/last_cost < self.min_cost_change:
+                print("Stopping as cost improvement is less than the threshold.")
+                running = False
+            else:
                 last_cost = new_cost
                 self.model.set_params(new_params)
                 print("New parameters:")
@@ -245,9 +250,9 @@ class imfbr:
                 region_of_interest = new_region_of_interest
                 union_region_of_interest |= region_of_interest
 
-            if const_improvement/last_cost < self.min_cost_change:
-                print("Stopping as cost improvement is less than the threshold.")
-                improved = False
+
+            if not (self.debug_window is None) and self.debug_window.stopped:
+                running = False
 
         print("Final parameters:")
         self.model.print_params()
@@ -256,10 +261,8 @@ class imfbr:
             pixelmath_expression = self.model.pixelmath_expression()
             print(f"$T - ({pixelmath_expression}) + {np.median(self.img[region_of_interest])}")
 
-        if self.show_debug_pictures:
-            print("Close the debug window to finish the script.")
-            plt.ioff()        # turn interactive OFF
-            plt.show()        # now blocks until user closes window
+        if not (self.debug_window is None):
+            self.debug_window.on_finished()
 
 instance = imfbr()
 instance.run()
