@@ -82,8 +82,7 @@ class imfbr_debug_window:
         self._refresh()
 
     def update_background_image(self, image):
-#        self.images[2].set_data(self.stf_stretch(image, self.default_histogram_params))
-        self.images[2].set_data(image)
+        self.images[2].set_data(self.stf_stretch(image, self.default_histogram_params))
         self._refresh()
 
     def update_region_of_interest(self, image):

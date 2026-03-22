@@ -19,14 +19,15 @@ class imfbr:
     ALL_PARAMETERS = {
         "input_paths": "",
         "dark_absolute_threshold": 0.0001,
-        "background_percentile": 10.0,
+        "background_high_percentile": 13.0,
+        "background_low_percentile": 3.0,
         "discarded_edge_size": 50,
         "mask_min_structure_size": 6,
         "mask_structure_growth": 1,
         "min_cost_change" : 2e-6,
         "model_type" : "e",
         "print_pixelmath_expression" : True,
-        "show_debug_pictures" : False,
+        "show_debug_pictures" : True,
 
         "e_inital_amplitude_clip_percentile_min" : 40,
         "e_inital_amplitude_clip_percentile_max" : 60,
@@ -57,7 +58,8 @@ class imfbr:
         parser.add_argument("-i", "--input_paths", type=str, help="Input file paths, separated by |. If omitted, all *.fit images in the current directory will be used.")
         parser.add_argument("-m", "--model_type", type=str, help="""Background model:\n  e: Exponential model in a form of
         [amplitude * exp((cos(direction) * x + sin(direction) * y) * decay) + constant]\n  p[n]: Polynomial with order n""")
-        parser.add_argument("-bp", "--background_percentile", type=float, help="The percentile of the area which can be considered as background.")
+        parser.add_argument("-bhp", "--background_high_percentile", type=float, help="Pixels between background_low_percentile and background_high_percentile will define the background mask.")
+        parser.add_argument("-blp", "--background_low_percentile", type=float, help="Pixels between background_low_percentile and background_high_percentile will define the background mask.")
         parser.add_argument("--dark_absolute_threshold", type=float, help="Any pixel value below this will be masked out.")
         parser.add_argument("--discarded_edge_size", type=int, help="The initial mask will be dilated by this many pixels (can be used to mask rough edges)")
         parser.add_argument("--mask_min_structure_size", type=int, help="Structures smaller than this many pixels in the mask will be removed.")
@@ -84,6 +86,13 @@ class imfbr:
 
         self.settings = {}
 
+        def parse_config_value(cfg_value, default):
+            if isinstance(default, bool):
+                parsed = cfg_value.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                parsed = type(default)(cfg_value)
+            return parsed
+
         for key, default in self.ALL_PARAMETERS.items():
             cli_value = getattr(args, key)
             cfg_value = config.get(key)
@@ -91,7 +100,7 @@ class imfbr:
             if cli_value is not None:
                 self.settings[key] = cli_value
             elif cfg_value is not None:
-                self.settings[key] = self.EXPLICIT_TYPES[key](cfg_value) if key in self.EXPLICIT_TYPES else type(default)(cfg_value)
+                self.settings[key] = self.EXPLICIT_TYPES[key](cfg_value) if key in self.EXPLICIT_TYPES else parse_config_value(cfg_value, default)
             elif key != 'input_paths':
                 self.settings[key] = default
                 print(f"[INFO] Using default for {key}: {default}")
@@ -103,7 +112,8 @@ class imfbr:
         self.model_type = self.settings["model_type"]
         self.input_paths = self.settings["input_paths"] if "input_paths" in self.settings else None
         self.dark_absolute_threshold = self.settings["dark_absolute_threshold"]
-        self.background_percentile = self.settings["background_percentile"]
+        self.background_low_percentile = self.settings["background_low_percentile"]
+        self.background_high_percentile = self.settings["background_high_percentile"]
         self.discarded_edge_size = self.settings["discarded_edge_size"]
         self.mask_min_structure_size = self.settings["mask_min_structure_size"]
         self.mask_structure_growth = self.settings["mask_structure_growth"]
@@ -124,31 +134,20 @@ class imfbr:
         if background is None:
             background = np.zeros_like(self.img)
 
-        img_corr = np.full_like(self.img, np.nan)
-        img_corr[self.grown_absolute_dark_mask] = self.img[self.grown_absolute_dark_mask] - background[self.grown_absolute_dark_mask]
+        self.img_corr_buffer.fill(np.nan)
+        np.subtract(self.img, background, out=self.img_corr_buffer, where=self.grown_absolute_dark_mask)
 
-        values = img_corr[self.grown_absolute_dark_mask]
-        threshold = np.percentile(values, self.background_percentile)
+        values = self.img_corr_buffer[self.grown_absolute_dark_mask]
+        threshold_low, threshold_high = np.percentile(values, [self.background_low_percentile, self.background_high_percentile])
 
-        intermediate = ((img_corr <= threshold) & self.grown_absolute_dark_mask)
+        intermediate = np.zeros_like(self.grown_absolute_dark_mask, dtype=bool)
+        intermediate[self.grown_absolute_dark_mask] = (values >= threshold_low) & (values <= threshold_high)
         if self.mask_min_structure_size > 0:
             intermediate = binary_erosion(intermediate, iterations = self.mask_min_structure_size)
         if self.mask_min_structure_size + self.mask_structure_growth > 0:
-            intermediate = binary_dilation(intermediate, iterations = self.mask_min_structure_size + self.mask_structure_growth)
+            intermediate = binary_dilation(intermediate, iterations = self.mask_min_structure_size + self.mask_structure_growth) & self.grown_absolute_dark_mask
 
-        return intermediate & self.grown_absolute_dark_mask
-
-    def calc_diagonal(self):
-        diagonal_x, diagonal_y = self.img.shape
-        return (diagonal_x ** 2.0 + diagonal_y ** 2.0) ** 0.5
-
-    def show_image(self, img, title):
-        plt.figure(figsize=(6, 6))
-        plt.imshow(img, cmap="gray", origin="lower")
-        plt.colorbar(label="Intensity")
-        plt.title(title)
-        plt.tight_layout()
-        plt.show()
+        return intermediate
 
     def run(self):
         self.show_debug_pictures = None
@@ -193,6 +192,7 @@ class imfbr:
         print(f"Rejected pixels: {rejected_pixels_mp}MP ({rejected_pct:.2f}%)")
 
         self.grown_absolute_dark_mask = binary_erosion(self.absolute_dark_mask, iterations = self.discarded_edge_size)
+        self.img_corr_buffer = np.empty_like(self.img)
 
         self.model = None
         if self.model_type == "e":
@@ -215,31 +215,25 @@ class imfbr:
             print("***************************")
             print("Calculating region of interest...")
             background = None if (region_of_interest is None) else self.model.generate_background()
-            if not (self.debug_window is None) and not (background is None):
+            if self.show_debug_pictures and not (background is None):
                 self.debug_window.update_background_image(background)
                 self.debug_window.update_corrected_image(self.img - background)
 
             new_region_of_interest = self.create_model_dark_mask(background)
-            if not (self.debug_window is None):
+            if self.show_debug_pictures:
                 self.debug_window.update_region_of_interest(new_region_of_interest)
-            print(f"Median in region of interest: {np.median(self.img[new_region_of_interest]):.6g}")
 
             new_pixels = new_region_of_interest & ~union_region_of_interest
             if not new_pixels.any():
                 print("Stopping as background mask doesn't have new pixels.")
                 running = False
                 break
-            else:
-                pct_total = new_pixels.sum() / new_region_of_interest.sum() * 100
-                print(f"Mask change: {pct_total:.2f}% of image")
 
             print(f"Fitting parameters...")
             new_cost, new_params = self.model.fit_params(self.img, new_region_of_interest, self.grown_absolute_dark_mask)
             print(f"New cost: {new_cost:.6g} Last cost: {last_cost:.6g}")
 
-            cost_improvement = last_cost - new_cost
-
-            if cost_improvement/last_cost < self.min_cost_change:
+            if not (last_cost == float("inf")) and (last_cost - new_cost)/last_cost < self.min_cost_change:
                 print("Stopping as cost improvement is less than the threshold.")
                 running = False
             else:
@@ -251,7 +245,7 @@ class imfbr:
                 union_region_of_interest |= region_of_interest
 
 
-            if not (self.debug_window is None) and self.debug_window.stopped:
+            if self.show_debug_pictures and self.debug_window.stopped:
                 running = False
 
         print("Final parameters:")
@@ -261,7 +255,7 @@ class imfbr:
             pixelmath_expression = self.model.pixelmath_expression()
             print(f"$T - ({pixelmath_expression}) + {np.median(self.img[region_of_interest])}")
 
-        if not (self.debug_window is None):
+        if self.show_debug_pictures:
             self.debug_window.on_finished()
 
 instance = imfbr()
